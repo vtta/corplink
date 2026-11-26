@@ -1,91 +1,113 @@
-//! Minimal SOCKS5 server (no auth) that bridges CONNECT requests to the WireGuard tunnel.
+//! SOCKS5 CONNECT over the current authenticated tunnel.
 use crate::Tunnel;
 use anyhow::{bail, Result};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
-/// Serve SOCKS5 on `listen` (e.g. "127.0.0.1:1080"), forwarding through `tun`.
-/// No authentication.
 pub async fn serve(tun: Tunnel, listen: &str) -> Result<()> {
     serve_auth(tun, listen, None).await
 }
 
-/// Serve SOCKS5 with optional username/password authentication (RFC 1929).
 pub async fn serve_auth(tun: Tunnel, listen: &str, auth: Option<(String, String)>) -> Result<()> {
-    let l = TcpListener::bind(listen).await?;
-    tracing::info!("socks5 listening on {listen}");
-    serve_on(tun, l, auth).await
+    serve_on(tun, bind(listen).await?, auth).await
 }
 
-/// Bind a SOCKS5 listener without serving yet (lets the caller read `local_addr()`,
-/// e.g. when binding an ephemeral port with "127.0.0.1:0").
 pub async fn bind(listen: &str) -> Result<TcpListener> {
     Ok(TcpListener::bind(listen).await?)
 }
 
-/// Serve SOCKS5 on a pre-bound listener with optional auth.
-pub async fn serve_on(tun: Tunnel, l: TcpListener, auth: Option<(String, String)>) -> Result<()> {
+pub async fn serve_on(
+    tun: Tunnel,
+    listener: TcpListener,
+    auth: Option<(String, String)>,
+) -> Result<()> {
+    let (_keep, current) = watch::channel(Some(tun));
+    serve_managed(current, listener, auth).await
+}
+
+/// The listener survives tunnel replacement. New requests made during recovery fail promptly.
+pub async fn serve_managed(
+    current: watch::Receiver<Option<Tunnel>>,
+    listener: TcpListener,
+    auth: Option<(String, String)>,
+) -> Result<()> {
     loop {
-        let (cli, _) = l.accept().await?;
-        let tun = tun.clone();
+        let (cli, _) = listener.accept().await?;
+        let current = current.clone();
         let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(cli, tun, auth).await { tracing::debug!("socks5 conn: {e}"); }
+            if let Err(e) = handle(cli, current, auth).await {
+                tracing::debug!("SOCKS connection: {e}");
+            }
         });
     }
 }
 
-async fn handle(mut cli: TcpStream, tun: Tunnel, auth: Option<(String, String)>) -> Result<()> {
-    // greeting
-    let mut h = [0u8; 2];
-    cli.read_exact(&mut h).await?;
-    if h[0] != 5 { bail!("not socks5"); }
-    let nm = h[1] as usize;
-    let mut methods = vec![0u8; nm];
-    cli.read_exact(&mut methods).await?;
-    if let Some((want_u, want_p)) = &auth {
-        // require username/password (method 0x02)
-        if !methods.contains(&0x02) { cli.write_all(&[5, 0xff]).await?; bail!("no acceptable auth"); }
-        cli.write_all(&[5, 0x02]).await?;
-        let mut v = [0u8; 1]; cli.read_exact(&mut v).await?; // version 1
-        let mut ul = [0u8; 1]; cli.read_exact(&mut ul).await?;
-        let mut u = vec![0u8; ul[0] as usize]; cli.read_exact(&mut u).await?;
-        let mut pl = [0u8; 1]; cli.read_exact(&mut pl).await?;
-        let mut pw = vec![0u8; pl[0] as usize]; cli.read_exact(&mut pw).await?;
-        let ok = u == want_u.as_bytes() && pw == want_p.as_bytes();
-        cli.write_all(&[1, if ok { 0 } else { 1 }]).await?;
-        if !ok { bail!("bad socks5 credentials"); }
-    } else {
-        cli.write_all(&[5, 0]).await?; // no auth
+async fn reply(cli: &mut TcpStream, code: u8) -> Result<()> {
+    cli.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    Ok(())
+}
+
+async fn field(cli: &mut TcpStream) -> Result<Vec<u8>> {
+    let len = cli.read_u8().await?;
+    let mut data = vec![0; len as usize];
+    cli.read_exact(&mut data).await?;
+    Ok(data)
+}
+
+async fn handle(
+    mut cli: TcpStream,
+    current: watch::Receiver<Option<Tunnel>>,
+    auth: Option<(String, String)>,
+) -> Result<()> {
+    if cli.read_u8().await? != 5 {
+        bail!("expected SOCKS5");
     }
-
-    // request
-    let mut r = [0u8; 4];
-    cli.read_exact(&mut r).await?;
-    if r[1] != 1 { cli.write_all(&[5, 7, 0, 1, 0,0,0,0, 0,0]).await?; bail!("only CONNECT"); }
-    let (host, is_ip): (String, Option<Ipv4Addr>) = match r[3] {
-        1 => { let mut a=[0u8;4]; cli.read_exact(&mut a).await?; let ip=Ipv4Addr::from(a); (ip.to_string(), Some(ip)) }
-        3 => { let mut l=[0u8;1]; cli.read_exact(&mut l).await?; let mut d=vec![0u8;l[0] as usize]; cli.read_exact(&mut d).await?; (String::from_utf8_lossy(&d).to_string(), None) }
-        _ => { cli.write_all(&[5, 8, 0, 1, 0,0,0,0, 0,0]).await?; bail!("bad atyp"); }
+    let methods = field(&mut cli).await?;
+    let method = if auth.is_some() { 2 } else { 0 };
+    if !methods.contains(&method) {
+        cli.write_all(&[5, 0xff]).await?;
+        bail!("no supported auth method");
+    }
+    cli.write_all(&[5, method]).await?;
+    if let Some((user, password)) = auth {
+        let version = cli.read_u8().await?;
+        let u = field(&mut cli).await?;
+        let p = field(&mut cli).await?;
+        let ok = version == 1 && u == user.as_bytes() && p == password.as_bytes();
+        cli.write_all(&[1, u8::from(!ok)]).await?;
+        if !ok {
+            bail!("SOCKS authentication failed");
+        }
+    }
+    let mut h = [0; 4];
+    cli.read_exact(&mut h).await?;
+    if h[0] != 5 || h[2] != 0 {
+        bail!("invalid SOCKS request");
+    }
+    if h[1] != 1 {
+        return reply(&mut cli, 7).await;
+    }
+    let host = match h[3] {
+        1 => Ipv4Addr::from(cli.read_u32().await?).to_string(),
+        3 => String::from_utf8(field(&mut cli).await?)?,
+        _ => return reply(&mut cli, 8).await,
     };
-    let mut p = [0u8; 2]; cli.read_exact(&mut p).await?;
-    let port = u16::from_be_bytes(p);
-
-    let upstream = match is_ip {
-        Some(ip) => tun.connect(ip, port).await,
-        None => tun.connect_host(&host, port).await,
+    let port = cli.read_u16().await?;
+    let tun = current.borrow().clone();
+    let Some(tun) = tun.filter(|t| !t.is_closed()) else {
+        return reply(&mut cli, 3).await;
     };
-    let upstream = match upstream {
+    let mut stream = match tun.connect_host(&host, port).await {
         Ok(s) => s,
-        Err(e) => { cli.write_all(&[5, 4, 0, 1, 0,0,0,0, 0,0]).await?; return Err(e); }
+        Err(_) => return reply(&mut cli, 4).await,
     };
-    cli.write_all(&[5, 0, 0, 1, 0,0,0,0, 0,0]).await?; // success
-
-    let (mut cr, mut cw) = tokio::io::split(cli);
-    let (mut ur, mut uw) = tokio::io::split(upstream);
-    let a = tokio::io::copy(&mut cr, &mut uw);
-    let b = tokio::io::copy(&mut ur, &mut cw);
-    let _ = tokio::try_join!(a, b);
+    reply(&mut cli, 0).await?;
+    tokio::select! {
+        _ = tun.closed() => {},
+        result = tokio::io::copy_bidirectional(&mut cli, &mut stream) => { result?; },
+    }
     Ok(())
 }

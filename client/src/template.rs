@@ -21,8 +21,10 @@ impl Template {
         }
     }
 
-    /// ```
     /// # Examples
+    /// ```
+    /// # use corplink_client::template::Template;
+    /// # use std::collections::HashMap;
     ///
     /// let template = Template::new("Hi, my name is {{name}} and I'm a {{lang}} developer.");
     ///

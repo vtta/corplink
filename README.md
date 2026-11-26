@@ -69,6 +69,16 @@ cargo run --release -p corplink-client -- config.json
 }
 ```
 
+## Recovery
+
+The CLI keeps its SOCKS5 listener bound during recovery. If the gateway TCP
+stream closes or WireGuard expires, it reconnects using the current Feilian
+login and requests fresh tunnel settings. On macOS, route notifications also
+trigger recovery when the source address used to reach the gateway changes.
+A generation becomes available to new requests after its WireGuard handshake.
+Existing streams close when their tunnel ends. Clients
+can retry on the same proxy address.
+
 ## Library usage (datapath only)
 
 You supply a `WgConf` (private/peer keys, endpoint, tunnel address, DNS, MTU),
