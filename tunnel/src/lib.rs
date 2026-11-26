@@ -16,8 +16,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
+mod datagram;
 mod device;
 mod path;
+use datagram::DatagramSocket;
 use std::{sync::Arc, time::Duration};
 use tokio::task::{AbortHandle, JoinSet};
 pub mod socks5;
@@ -35,8 +37,12 @@ pub struct WgConf {
     pub peer_key: String,    // base64
     pub dns: String,
     pub protocol: i32, // 1 = tcp
-    #[serde(default)]
+    #[serde(default = "default_allowed_ips")]
     pub allowed_ips: Vec<String>,
+}
+
+fn default_allowed_ips() -> Vec<String> {
+    vec!["0.0.0.0/0".to_owned()]
 }
 
 fn b64_32(s: &str) -> Result<[u8; 32]> {
@@ -58,6 +64,9 @@ fn now() -> SmolInstant {
 }
 
 enum Cmd {
+    BindUdp {
+        resp: oneshot::Sender<Result<DatagramSocket>>,
+    },
     Connect {
         dst: (Ipv4Addr, u16),
         resp: oneshot::Sender<Result<TunnelStream>>,
@@ -132,6 +141,15 @@ impl Tunnel {
 
     pub fn stop(&self) {
         self.worker.0.abort();
+    }
+
+    pub(crate) async fn bind_udp(&self) -> Result<DatagramSocket> {
+        let (resp, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::BindUdp { resp })
+            .await
+            .context("tunnel closed")?;
+        rx.await.context("tunnel closed during UDP bind")?
     }
 
     /// Resolve a hostname to an IPv4 address using the VPN's DNS server, through the tunnel.
@@ -382,6 +400,7 @@ async fn run_tunnel(
         let _ = net_out_tx.send(p.to_vec());
     }
     let mut ready = Some(ready);
+    let mut datagrams = datagram::Sockets::new(&conf.allowed_ips)?;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
     loop {
@@ -402,6 +421,7 @@ async fn run_tunnel(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return Ok(()); };
                 match cmd {
+                    Cmd::BindUdp { resp } => { let _ = resp.send(datagrams.bind(&mut sockets)); }
                     Cmd::Resolve { name, resp } => {
                         dns_id = dns_id.wrapping_add(1);
                         let q = build_dns_query(&name, dns_id);
@@ -468,6 +488,7 @@ async fn run_tunnel(
             }
         }
         pending_dns.retain(|(_, resp)| !resp.is_closed());
+        datagrams.pump(&mut sockets);
         pump(&mut sockets, &mut conns);
         // encapsulate outgoing IP packets
         while let Some(ip) = device.tx.pop_front() {

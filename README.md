@@ -69,15 +69,21 @@ cargo run --release -p corplink-client -- config.json
 }
 ```
 
-## Recovery
+## Recovery and UDP relay
 
 The CLI keeps its SOCKS5 listener bound during recovery. If the gateway TCP
 stream closes or WireGuard expires, it reconnects using the current Feilian
 login and requests fresh tunnel settings. On macOS, route notifications also
 trigger recovery when the source address used to reach the gateway changes.
 A generation becomes available to new requests after its WireGuard handshake.
-Existing streams close when their tunnel ends. Clients
+Existing streams and UDP associations close when their tunnel ends. Clients
 can retry on the same proxy address.
+
+UDP-capable SOCKS5 clients can use UDP ASSOCIATE with the same authentication
+as CONNECT. The relay returns its bound address and port in the SOCKS reply.
+It accepts IPv4 destinations and hostnames resolved through the tunnel.
+The TCP control connection owns the association. SOCKS5-level fragmentation
+and IPv6 tunnel destinations are unsupported.
 
 ## Library usage (datapath only)
 

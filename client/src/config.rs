@@ -80,7 +80,7 @@ pub struct Config {
     /// When set, run entirely in userspace (gVisor netstack) and expose a SOCKS5
     /// proxy at this listen address (e.g. "0.0.0.0:1080" or "127.0.0.1:1080")
     /// instead of creating a kernel TUN device. No system interface, routes, DNS
-    /// changes or root privileges are required. Only TCP CONNECT is supported.
+    /// changes or root privileges are required. Supports CONNECT and UDP ASSOCIATE.
     pub socks5_listen: Option<String>,
     /// Optional SOCKS5 username/password authentication (RFC 1929). When
     /// `socks5_username` is set and non-empty, clients must authenticate with
